@@ -1,0 +1,372 @@
+#!/bin/bash
+
+set -u
+
+PROGRAM_NAME="media-key-router"
+CONFIG_DIR="${MEDIA_KEY_ROUTER_CONFIG_DIR:-${HOME}/.config/media-key-router}"
+CONFIG_FILE="${CONFIG_DIR}/config.json"
+STATE_DIR="${MEDIA_KEY_ROUTER_STATE_DIR:-${TMPDIR:-/tmp}/media-key-router-${UID}}"
+TOGGLE_LOCK_FILE="${STATE_DIR}/toggle.lockf"
+LOG_FILE="${MEDIA_KEY_ROUTER_LOG_FILE:-${HOME}/Library/Logs/MediaKeyRouter.log}"
+DEBOUNCE_MS="${MEDIA_KEY_ROUTER_DEBOUNCE_MS:-300}"
+
+OPEN_BIN="${MEDIA_KEY_ROUTER_OPEN_BIN:-/usr/bin/open}"
+OSASCRIPT_BIN="${MEDIA_KEY_ROUTER_OSASCRIPT_BIN:-/usr/bin/osascript}"
+PGREP_BIN="${MEDIA_KEY_ROUTER_PGREP_BIN:-/usr/bin/pgrep}"
+LOCKF_BIN="${MEDIA_KEY_ROUTER_LOCKF_BIN:-/usr/bin/lockf}"
+PLUTIL_BIN="${MEDIA_KEY_ROUTER_PLUTIL_BIN:-/usr/bin/plutil}"
+PLISTBUDDY_BIN="${MEDIA_KEY_ROUTER_PLISTBUDDY_BIN:-/usr/libexec/PlistBuddy}"
+PERL_BIN="${MEDIA_KEY_ROUTER_PERL_BIN:-/usr/bin/perl}"
+
+DEFAULT_FALLBACK_PATH="/Applications/Spotify.app"
+DEFAULT_FALLBACK_BUNDLE_ID="com.spotify.client"
+DEFAULT_FALLBACK_NAME="Spotify"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  media-key-router toggle
+  media-key-router status
+  media-key-router default
+  media-key-router default /Applications/Player.app
+
+Commands:
+  toggle    Toggle the current macOS Now Playing session, or start the fallback.
+  status    Show the configured fallback and dependency/session diagnostics.
+  default   Show or change the persistent fallback media application.
+EOF
+}
+
+log_message() {
+  local log_dir
+  log_dir=$(dirname "$LOG_FILE")
+  mkdir -p "$log_dir" 2>/dev/null || return 0
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+find_nowplaying() {
+  if [ -n "${MEDIA_KEY_ROUTER_NOWPLAYING_BIN:-}" ]; then
+    [ -x "$MEDIA_KEY_ROUTER_NOWPLAYING_BIN" ] && printf '%s\n' "$MEDIA_KEY_ROUTER_NOWPLAYING_BIN"
+    return
+  fi
+
+  local candidate
+  for candidate in /opt/homebrew/bin/nowplaying-cli /usr/local/bin/nowplaying-cli; do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+
+  command -v nowplaying-cli 2>/dev/null || true
+}
+
+json_value() {
+  local key="$1"
+  local json="$2"
+  printf '%s' "$json" | "$PLUTIL_BIN" -extract "$key" raw -o - - 2>/dev/null
+}
+
+read_config_value() {
+  local key="$1"
+  [ -f "$CONFIG_FILE" ] || return 1
+  "$PLUTIL_BIN" -extract "$key" raw -o - "$CONFIG_FILE" 2>/dev/null
+}
+
+fallback_path() {
+  read_config_value fallback_path || printf '%s\n' "$DEFAULT_FALLBACK_PATH"
+}
+
+fallback_bundle_id() {
+  read_config_value fallback_bundle_id || printf '%s\n' "$DEFAULT_FALLBACK_BUNDLE_ID"
+}
+
+fallback_name() {
+  read_config_value fallback_name || printf '%s\n' "$DEFAULT_FALLBACK_NAME"
+}
+
+write_config() {
+  local app_path="$1"
+  local bundle_id="$2"
+  local app_name="$3"
+  local temp_dir temp_plist temp_file
+
+  mkdir -p "$CONFIG_DIR"
+  temp_dir=$(mktemp -d "${CONFIG_DIR}/config-write.XXXXXX") || return 1
+  temp_plist="${temp_dir}/config.plist"
+  temp_file="${temp_dir}/config.json"
+  if ! "$PLUTIL_BIN" -create xml1 "$temp_plist" \
+      || ! "$PLUTIL_BIN" -insert fallback_path -string "$app_path" "$temp_plist" \
+      || ! "$PLUTIL_BIN" -insert fallback_bundle_id -string "$bundle_id" "$temp_plist" \
+      || ! "$PLUTIL_BIN" -insert fallback_name -string "$app_name" "$temp_plist" \
+      || ! "$PLUTIL_BIN" -convert json -o "$temp_file" "$temp_plist"; then
+    rm -f "$temp_plist" "$temp_file"
+    rmdir "$temp_dir" 2>/dev/null || true
+    return 1
+  fi
+  rm -f "$temp_plist"
+  chmod 600 "$temp_file"
+  mv "$temp_file" "$CONFIG_FILE"
+  rmdir "$temp_dir" 2>/dev/null || true
+}
+
+set_default() {
+  local app_path="$1"
+  local info_plist bundle_id app_name
+
+  case "$app_path" in
+    /*.app) ;;
+    *)
+      printf '%s\n' "The fallback must be an absolute .app path." >&2
+      return 2
+      ;;
+  esac
+
+  if [ ! -d "$app_path" ]; then
+    printf 'Application not found: %s\n' "$app_path" >&2
+    return 2
+  fi
+
+  info_plist="${app_path}/Contents/Info.plist"
+  if [ ! -f "$info_plist" ]; then
+    printf 'Application has no Info.plist: %s\n' "$app_path" >&2
+    return 2
+  fi
+
+  bundle_id=$("$PLISTBUDDY_BIN" -c 'Print :CFBundleIdentifier' "$info_plist" 2>/dev/null || true)
+  app_name=$("$PLISTBUDDY_BIN" -c 'Print :CFBundleDisplayName' "$info_plist" 2>/dev/null || true)
+  if [ -z "$app_name" ]; then
+    app_name=$("$PLISTBUDDY_BIN" -c 'Print :CFBundleName' "$info_plist" 2>/dev/null || true)
+  fi
+  [ -n "$app_name" ] || app_name=$(basename "$app_path" .app)
+
+  case "$bundle_id" in
+    ''|*[!A-Za-z0-9._-]*)
+      printf 'Invalid or missing bundle identifier in %s\n' "$info_plist" >&2
+      return 2
+      ;;
+  esac
+
+  write_config "$app_path" "$bundle_id" "$app_name" || {
+    printf 'Could not write %s\n' "$CONFIG_FILE" >&2
+    return 1
+  }
+  printf 'Default player: %s (%s)\n' "$app_name" "$app_path"
+}
+
+get_session_json() {
+  local nowplaying_bin="$1"
+  "$nowplaying_bin" get --json playbackRate title clientBundleIdentifier uniqueIdentifier 2>/dev/null
+}
+
+has_session() {
+  local json="$1"
+  local key
+  for key in playbackRate title clientBundleIdentifier uniqueIdentifier; do
+    if json_value "$key" "$json" >/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+music_is_running() {
+  "$PGREP_BIN" -x Music >/dev/null 2>&1
+}
+
+current_time_ms() {
+  "$PERL_BIN" -MTime::HiRes=time -e 'printf "%.0f", time() * 1000'
+}
+
+acquire_toggle_lock() {
+  local lock_status
+  mkdir -p "$STATE_DIR" 2>/dev/null || {
+    log_message "Could not create toggle state directory: ${STATE_DIR}"
+    return 1
+  }
+  if [ ! -x "$LOCKF_BIN" ]; then
+    log_message "lockf is missing: ${LOCKF_BIN}"
+    return 1
+  fi
+
+  "$LOCKF_BIN" -s -t 0 -k "$TOGGLE_LOCK_FILE" /bin/bash "$0" _toggle_locked
+  lock_status=$?
+  case "$lock_status" in
+    0|75) return 0 ;;
+  esac
+  log_message "Could not run toggle under lockf (exit ${lock_status})"
+  return "$lock_status"
+}
+
+toggle_media_locked() {
+  local now previous difference
+  now=$(current_time_ms)
+  previous=0
+  if [ -f "${STATE_DIR}/last-toggle-ms" ]; then
+    IFS= read -r previous < "${STATE_DIR}/last-toggle-ms" || previous=0
+  fi
+  case "$previous" in
+    ''|*[!0-9]*) previous=0 ;;
+  esac
+  difference=$((now - previous))
+  if [ "$difference" -ge 0 ] && [ "$difference" -lt "$DEBOUNCE_MS" ]; then
+    return 0
+  fi
+  printf '%s\n' "$now" > "${STATE_DIR}/last-toggle-ms"
+  toggle_media_unlocked
+}
+
+tell_application_to_play() {
+  local bundle_id="$1"
+  case "$bundle_id" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  "$OSASCRIPT_BIN" -e "tell application id \"${bundle_id}\" to play" >/dev/null 2>&1
+}
+
+start_fallback() {
+  local nowplaying_bin="${1:-}"
+  local app_path bundle_id app_name session_json attempt
+  app_path=$(fallback_path)
+  bundle_id=$(fallback_bundle_id)
+  app_name=$(fallback_name)
+
+  if [ ! -d "$app_path" ]; then
+    log_message "Fallback application is missing: ${app_path}"
+    return 1
+  fi
+
+  "$OPEN_BIN" -gj "$app_path" >/dev/null 2>&1 || {
+    log_message "Could not open fallback application: ${app_path}"
+    return 1
+  }
+
+  if tell_application_to_play "$bundle_id"; then
+    log_message "Started fallback player: ${app_name}"
+    return 0
+  fi
+
+  if [ -n "$nowplaying_bin" ]; then
+    attempt=0
+    while [ "$attempt" -lt 20 ]; do
+      sleep 0.1
+      session_json=$(get_session_json "$nowplaying_bin" || true)
+      if has_session "$session_json"; then
+        "$nowplaying_bin" play >/dev/null 2>&1 || true
+        log_message "Started fallback through Now Playing: ${app_name}"
+        return 0
+      fi
+      attempt=$((attempt + 1))
+    done
+  fi
+
+  log_message "Opened fallback, but could not start playback automatically: ${app_name}"
+  return 0
+}
+
+toggle_media_unlocked() {
+  local nowplaying_bin session_json source_bundle
+
+  nowplaying_bin=$(find_nowplaying)
+  if [ -z "$nowplaying_bin" ]; then
+    log_message "nowplaying-cli is missing; using the fallback player"
+    start_fallback ""
+    return
+  fi
+
+  session_json=$(get_session_json "$nowplaying_bin" || true)
+  if has_session "$session_json"; then
+    source_bundle=$(json_value clientBundleIdentifier "$session_json" || true)
+    if [ "$source_bundle" = "com.apple.Music" ] && ! music_is_running; then
+      log_message "Ignored a stale Apple Music session"
+      start_fallback "$nowplaying_bin"
+      return
+    fi
+    "$nowplaying_bin" togglePlayPause >/dev/null 2>&1 || {
+      log_message "Now Playing toggle failed; using the fallback player"
+      start_fallback "$nowplaying_bin"
+      return
+    }
+    return 0
+  fi
+
+  start_fallback "$nowplaying_bin"
+}
+
+toggle_media() {
+  acquire_toggle_lock
+}
+
+show_default() {
+  printf 'Default player: %s\n' "$(fallback_name)"
+  printf 'Application: %s\n' "$(fallback_path)"
+  printf 'Bundle ID: %s\n' "$(fallback_bundle_id)"
+}
+
+show_status() {
+  local failures=0 nowplaying_bin session_json source_bundle title
+  show_default
+  if [ -d "$(fallback_path)" ]; then
+    printf 'Fallback application: OK\n'
+  else
+    printf 'Fallback application: MISSING\n'
+    failures=$((failures + 1))
+  fi
+
+  nowplaying_bin=$(find_nowplaying)
+  if [ -z "$nowplaying_bin" ]; then
+    printf 'nowplaying-cli: MISSING\n'
+    failures=$((failures + 1))
+  else
+    printf 'nowplaying-cli: %s\n' "$nowplaying_bin"
+    if ! session_json=$(get_session_json "$nowplaying_bin"); then
+      printf 'Now Playing query: FAILED\n'
+      failures=$((failures + 1))
+    elif has_session "$session_json"; then
+      source_bundle=$(json_value clientBundleIdentifier "$session_json" || printf 'unknown')
+      title=$(json_value title "$session_json" || printf 'untitled')
+      printf 'Now Playing session: %s — %s\n' "$source_bundle" "$title"
+    else
+      printf 'Now Playing session: none\n'
+    fi
+  fi
+
+  if [ -f "${HOME}/.config/karabiner/karabiner.json" ] \
+      && grep -Fq 'Smart F8 play/pause with configurable fallback' "${HOME}/.config/karabiner/karabiner.json"; then
+    printf 'Karabiner rule: enabled\n'
+  else
+    printf 'Karabiner rule: not enabled\n'
+    failures=$((failures + 1))
+  fi
+  return "$failures"
+}
+
+case "${1:-}" in
+  toggle)
+    toggle_media
+    ;;
+  _toggle_locked)
+    toggle_media_locked
+    ;;
+  status)
+    show_status
+    ;;
+  default)
+    if [ "$#" -eq 1 ]; then
+      show_default
+    elif [ "$#" -eq 2 ]; then
+      set_default "$2"
+    else
+      usage >&2
+      exit 2
+    fi
+    ;;
+  help|-h|--help|'')
+    usage
+    ;;
+  *)
+    printf 'Unknown command: %s\n' "$1" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

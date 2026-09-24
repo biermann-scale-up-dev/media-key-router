@@ -1,0 +1,35 @@
+{
+  "title": "Media Key Router",
+  "rules": [
+    {
+      "description": "Smart F8 play/pause with configurable fallback",
+      "manipulators": [
+        {
+          "type": "basic",
+          "from": {
+            "key_code": "f8",
+            "modifiers": {
+              "optional": ["any"]
+            }
+          },
+          "to": [
+            {
+              "shell_command": "/bin/bash \"$HOME/.local/libexec/media-key-router/media-key-router\" toggle"
+            }
+          ]
+        },
+        {
+          "type": "basic",
+          "from": {
+            "consumer_key_code": "play_or_pause"
+          },
+          "to": [
+            {
+              "shell_command": "/bin/bash \"$HOME/.local/libexec/media-key-router/media-key-router\" toggle"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
